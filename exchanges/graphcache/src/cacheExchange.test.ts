@@ -230,6 +230,141 @@ describe('data dependencies', () => {
     expect(result.mock.calls[0][0].data).toBe(null);
   });
 
+  it('respects cache-only operations ater mutation', () => {
+    const mutation = gql`
+      mutation ($userId: ID!, $amount: Int!) {
+        updateBalance(userId: $userId, amount: $amount) {
+          userId
+          balance {
+            amount
+          }
+        }
+      }
+    `;
+
+    const client = createClient({
+      url: 'http://0.0.0.0',
+      exchanges: [],
+    });
+
+    const opMutation = client.createRequestOperation('mutation', {
+      key: 1,
+      query: mutation,
+      variables: { userId: '1', amount: 1000 },
+    });
+
+    const mutationData = {
+      __typename: 'Mutation',
+      updateBalance: {
+        __typename: 'UpdateBalanceResult',
+        userId: '1',
+        balance: {
+          __typename: 'Balance',
+          amount: 100,
+        },
+      },
+    };
+
+    const balanceFragment = gql`
+      fragment BalanceFragment on Author {
+        id
+        balance {
+          amount
+        }
+      }
+    `;
+
+    const queryById = gql`
+      query ($id: ID!) {
+        author(id: $id) {
+          id
+          name
+          ...BalanceFragment
+        }
+      }
+
+      ${balanceFragment}
+    `;
+
+    const queryByIdDataA = {
+      __typename: 'Query',
+      author: {
+        __typename: 'Author',
+        id: '1',
+        name: 'Author 1',
+        balance: {
+          __typename: 'Balance',
+          amount: 100,
+        },
+      },
+    };
+
+    const op = client.createRequestOperation(
+      'query',
+      {
+        key: 2,
+        query: queryById,
+        variables: { id: 1 },
+      },
+      {
+        requestPolicy: 'cache-only',
+      }
+    );
+
+    const response = vi.fn((forwardOp: Operation): OperationResult => {
+      if (forwardOp.key === 1) {
+        return {
+          ...queryResponse,
+          operation: opMutation,
+          data: mutationData,
+        };
+      } else if (forwardOp.key === 2) {
+        return { ...queryResponse, operation: forwardOp, data: queryByIdDataA };
+      }
+      return undefined as any;
+    });
+
+    const { source: ops$, next } = makeSubject<Operation>();
+    const result = vi.fn();
+    const forward: ExchangeIO = ops$ => pipe(ops$, map(response), share);
+
+    const updates = {
+      Mutation: {
+        updateBalance: vi.fn((result, _args, cache) => {
+          const {
+            updateBalance: { userId, balance },
+          } = result;
+          cache.writeFragment(balanceFragment, { id: userId, balance });
+        }),
+      },
+    };
+
+    const keys = {
+      Balance: () => null,
+    };
+
+    pipe(
+      cacheExchange({ updates, keys })({ forward, client, dispatchDebug })(
+        ops$
+      ),
+      tap(result),
+      publish
+    );
+
+    next(opMutation);
+
+    next(op);
+    expect(response).toHaveBeenCalledTimes(0);
+    expect(result).toHaveBeenCalledTimes(1);
+
+    expect(result.mock.calls[0][0]).toHaveProperty(
+      'operation.context.meta.cacheOutcome',
+      'miss'
+    );
+
+    expect(result.mock.calls[0][0].data).toBe(null);
+  });
+
   it('updates related queries when their data changes', () => {
     const queryMultiple = gql`
       {
